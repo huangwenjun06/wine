@@ -166,6 +166,58 @@ void lsp_catalog_cleanup(void)
 }
 
 /* ======================================================================
+ * Catalog Fixups
+ * ===================================================================== */
+
+/* Some LSP installers write a broken protocol chain whose base slot
+ * points back at the LSP itself.  SSLVPNRedirector.dll is a real case:
+ * its chain is [1001, 1001] - the LSP's own catalog id is 1001, which
+ * also collides with the builtin TCP/IP provider (catalog id 1001).
+ * The LSP DLL then walks the chain recursively forever, exhausting its
+ * thread stack, and every WSC* call it makes from that point runs out
+ * of stack (WSPStartup eventually fails with ERROR_INVALID_PARAMETER).
+ *
+ * We repair the in-memory copy: remap our catalog id out of the builtin
+ * range (1001..1040) and point the base slot at the real builtin base
+ * provider matching our af/type/proto.  The registry is left untouched;
+ * the fixup is re-applied on every load. */
+static void lsp_fixup_provider_chain(LSP_PROVIDER_ENTRY *p)
+{
+    DWORD old_id = p->info.dwCatalogEntryId;
+    DWORD new_id = old_id;
+    int i;
+
+    /* Builtin providers own catalog ids 1001..1040. */
+    if (old_id >= 1001 && old_id <= 1040)
+    {
+        new_id = LSP_BASE_CATALOG_ENTRY_ID;
+        while (lsp_find_provider_by_entry_id( new_id )) new_id++;
+        TRACE("lsp_fixup_provider_chain: '%s' id %lu -> %lu (builtin collision)\n",
+              debugstr_w(p->info.szProtocol), old_id, new_id);
+        p->info.dwCatalogEntryId = new_id;
+    }
+
+    /* ChainEntries[0] is the LSP itself; keep it in sync. */
+    if (p->info.ProtocolChain.ChainLen > 0 &&
+        p->info.ProtocolChain.ChainEntries[0] == old_id)
+        p->info.ProtocolChain.ChainEntries[0] = new_id;
+
+    /* Base slots must never point back at us. */
+    for (i = 1; i < p->info.ProtocolChain.ChainLen; i++)
+    {
+        if (p->info.ProtocolChain.ChainEntries[i] == old_id ||
+            p->info.ProtocolChain.ChainEntries[i] == new_id)
+        {
+            int base = lsp_get_builtin_base_entry_id( &p->info );
+            TRACE("lsp_fixup_provider_chain: '%s' chain[%d] %lu -> %d\n",
+                  debugstr_w(p->info.szProtocol), i,
+                  (DWORD)p->info.ProtocolChain.ChainEntries[i], base);
+            p->info.ProtocolChain.ChainEntries[i] = base;
+        }
+    }
+}
+
+/* ======================================================================
  * Catalog Load from Registry
  * ===================================================================== */
 int lsp_catalog_load(void)
@@ -249,9 +301,10 @@ int lsp_catalog_load(void)
                             }
                             list_add_tail(&g_catalog.providers, &p->entry);
                             g_catalog.count++;
+                            lsp_fixup_provider_chain( p );
                             TRACE("Loaded: %s (id=%lu, cl=%d)\n",
                                   debugstr_w(info.szProtocol),
-                                  info.dwCatalogEntryId, info.ProtocolChain.ChainLen);
+                                  p->info.dwCatalogEntryId, p->info.ProtocolChain.ChainLen);
                         }
                     }
                     RegCloseKey(hEntry);
@@ -826,6 +879,61 @@ LSP_PROVIDER_ENTRY *lsp_get_chain_next(LSP_PROVIDER_ENTRY *provider)
 }
 
 /* ======================================================================
+ * LSP Socket Registry
+ *
+ * Tracks which sockets were created through an LSP provider's WSPSocket
+ * so that later WSP calls (connect/send/recv/close) can be dispatched to
+ * that provider instead of hitting the base provider directly.  A real
+ * LSP (SSLVPNRedirector.dll) implements its VPN redirect entirely in
+ * WSPConnect - without this dispatch the traffic never goes through it.
+ * ===================================================================== */
+
+typedef struct _LSP_SOCKET_ENTRY
+{
+    struct list entry;
+    SOCKET s;
+    LSP_PROVIDER_ENTRY *provider;
+} LSP_SOCKET_ENTRY;
+
+static struct list g_lsp_sockets = LIST_INIT(g_lsp_sockets);
+
+void lsp_socket_register(SOCKET s, LSP_PROVIDER_ENTRY *provider)
+{
+    LSP_SOCKET_ENTRY *e;
+    if (!provider) return;
+    lsp_ensure_init();
+    e = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*e));
+    if (!e) return;
+    e->s = s;
+    e->provider = provider;
+    EnterCriticalSection(&g_catalog.lock);
+    list_add_tail(&g_lsp_sockets, &e->entry);
+    LeaveCriticalSection(&g_catalog.lock);
+    TRACE("LSP socket %#Ix -> '%s'\n", s, debugstr_w(provider->info.szProtocol));
+}
+
+LSP_PROVIDER_ENTRY *lsp_socket_find_provider(SOCKET s)
+{
+    LSP_SOCKET_ENTRY *e;
+    LSP_PROVIDER_ENTRY *p = NULL;
+    if (list_empty(&g_lsp_sockets)) return NULL;
+    EnterCriticalSection(&g_catalog.lock);
+    LIST_FOR_EACH_ENTRY(e, &g_lsp_sockets, LSP_SOCKET_ENTRY, entry)
+        if (e->s == s) { p = e->provider; break; }
+    LeaveCriticalSection(&g_catalog.lock);
+    return p;
+}
+
+void lsp_socket_unregister(SOCKET s)
+{
+    LSP_SOCKET_ENTRY *e, *n;
+    EnterCriticalSection(&g_catalog.lock);
+    LIST_FOR_EACH_ENTRY_SAFE(e, n, &g_lsp_sockets, LSP_SOCKET_ENTRY, entry)
+        if (e->s == s) { list_remove(&e->entry); HeapFree(GetProcessHeap(), 0, e); break; }
+    LeaveCriticalSection(&g_catalog.lock);
+}
+
+/* ======================================================================
  * Add/Remove/Enable Provider
  * ===================================================================== */
 
@@ -939,6 +1047,14 @@ int lsp_enum_protocols(int *protocols, WSAPROTOCOL_INFOW *buffer,
 
 BOOL lsp_is_lsp_loaded(void) { return g_catalog.count > 0; }
 void lsp_set_lsp_enabled(BOOL enabled) { g_catalog.lsp_enabled = enabled; }
+
+/* TRUE once the LSP catalog has been read into memory.  WSCEnumProtocols
+ * uses this to decide whether it can serve results from memory (stack-light)
+ * or must walk the registry (deep). */
+BOOL lsp_catalog_loaded(void)
+{
+    return g_catalog.initialized && g_catalog.count > 0;
+}
 
 /* ======================================================================
  * Write Provider Order

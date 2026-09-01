@@ -1259,6 +1259,7 @@ int WINAPI closesocket( SOCKET s )
         return -1;
     }
 
+    lsp_socket_unregister( s );
     CloseHandle( (HANDLE)s );
     return 0;
 }
@@ -1270,11 +1271,49 @@ int WINAPI closesocket( SOCKET s )
 int WINAPI connect( SOCKET s, const struct sockaddr *addr, int len )
 {
     struct afd_connect_params *params;
+    struct per_thread_data *ptd;
     IO_STATUS_BLOCK io;
     HANDLE sync_event;
     NTSTATUS status;
 
     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
+
+    /* LSP dispatch: delegate connect() to the owning LSP's WSPConnect so
+     * the LSP can redirect the connection (SSLVPNRedirector.dll forwards
+     * it to the local TBSGClient proxy and sends the original destination
+     * in a handshake).  Reentrancy guard mirrors WSASocketW: while an LSP
+     * WSP call is in flight, the LSP's own underlying connect must not be
+     * dispatched again. */
+    ptd = get_per_thread_data();
+    if (!ptd->lsp_in_dispatch && addr && len > 0)
+    {
+        LSP_PROVIDER_ENTRY *p = lsp_socket_find_provider( s );
+        if (p && p->proc_table && p->proc_table->lpWSPConnect)
+        {
+            LSP_WSPCONNECT_FUNC wsp_connect = (LSP_WSPCONNECT_FUNC)p->proc_table->lpWSPConnect;
+            int lsp_errno = 0;
+            int lsp_ret;
+            TRACE( "LSP: calling WSPConnect socket %#Ix -> %s\n", s, debugstr_sockaddr(addr) );
+            ptd->lsp_in_dispatch = TRUE;
+            lsp_ret = wsp_connect( s, addr, len, NULL, NULL, NULL, NULL, &lsp_errno );
+            ptd->lsp_in_dispatch = FALSE;
+            if (lsp_ret == 0)
+            {
+                TRACE( "LSP: WSPConnect ok, delegated to '%s'\n", debugstr_w(p->info.szProtocol) );
+                return 0;
+            }
+            if (lsp_errno == WSAEWOULDBLOCK)
+            {
+                /* Non-blocking socket: connection in progress.  Return
+                 * exactly what the base AFD connect would - the app polls
+                 * with select()/WSAEventSelect() for completion. */
+                TRACE( "LSP: WSPConnect async in progress (WSAEWOULDBLOCK)\n" );
+                SetLastError( WSAEWOULDBLOCK );
+                return -1;
+            }
+            TRACE( "LSP: WSPConnect failed errno=%d, falling back\n", lsp_errno );
+        }
+    }
 
     if (!(sync_event = get_sync_event())) return -1;
 
@@ -3949,21 +3988,29 @@ SOCKET WINAPI WSASocketW(int af, int type, int protocol,
 
        LSP_PROVIDER_ENTRY *lsp_provider = NULL;
     LPWSPPROC_TABLE dispatch = NULL;
+    struct per_thread_data *ptd;
 
     TRACE( "af=%d type=%d protocol=%d info=%p g=%d flags=%#lx\n",
            af, type, protocol, lpProtocolInfo, g, flags );
 
-    /* LSP dispatch: delegate to LSP WSPSocket if registered */
-    ERR( "WSASocketW ENTRY: af=%d type=%d proto=%d info=%p\n", af, type, protocol, lpProtocolInfo );
+    /* LSP dispatch: delegate to LSP WSPSocket if registered.
+     * Reentrancy guard: while an LSP WSPSocket call is in flight on this
+     * thread, the LSP DLL itself calls socket()/WSASocketW() to create the
+     * underlying base socket.  Without the guard those calls match the same
+     * LSP again, recursing until the thread stack overflows (firefox died
+     * with an unhandled stack overflow after a few hundred rounds). */
+    ptd = get_per_thread_data();
+    ERR( "WSASocketW ENTRY: af=%d type=%d proto=%d info=%p in_dispatch=%d\n",
+         af, type, protocol, lpProtocolInfo, ptd->lsp_in_dispatch );
     lsp_catalog_load();
     ERR( "WSASocketW: catalog loaded, lsp_loaded=%d\n", lsp_is_lsp_loaded() );
-    if (!lpProtocolInfo && lsp_is_lsp_loaded())
+    if (!ptd->lsp_in_dispatch && lsp_is_lsp_loaded())
     {
         ERR( "LSP: looking for match af=%d type=%d proto=%d\n", af, type, protocol );
         lsp_provider = lsp_find_provider_by_match( af, type, protocol );
         ERR( "LSP: match=%p\n", lsp_provider );
     }
-    else if (lpProtocolInfo && lpProtocolInfo->ProtocolChain.ChainLen > 1)
+    else if (!ptd->lsp_in_dispatch && lpProtocolInfo && lpProtocolInfo->ProtocolChain.ChainLen > 1)
     {
         TRACE( "LSP: protocol info entry_id=%lu chain_len=%d\n",
                lpProtocolInfo->dwCatalogEntryId, lpProtocolInfo->ProtocolChain.ChainLen );
@@ -3980,15 +4027,19 @@ SOCKET WINAPI WSASocketW(int af, int type, int protocol,
         {
             LSP_WSPSOCKET_FUNC wsp_socket = (LSP_WSPSOCKET_FUNC)dispatch->lpWSPSocket;
             TRACE( "LSP: calling WSPSocket af=%d type=%d proto=%d\n", af, type, protocol );
+            ptd->lsp_in_dispatch = TRUE;
             {
                 SOCKET lsp_ret = wsp_socket( af, type, protocol, lpProtocolInfo, g, flags );
+                ptd->lsp_in_dispatch = FALSE;
                 TRACE( "LSP: WSPSocket returned %#Ix\n", lsp_ret );
                 if (lsp_ret != INVALID_SOCKET)
                 {
+                    lsp_socket_register( lsp_ret, lsp_provider );
                     TRACE( "Delegated to LSP '%s'\n", debugstr_w(lsp_provider->info.szProtocol) );
                     return lsp_ret;
                 }
             }
+            ptd->lsp_in_dispatch = FALSE;
             WARN( "LSP WSPSocket failed, falling back\n" );
         }
     }
@@ -4350,6 +4401,64 @@ static BOOL protocol_matches_filter( const int *filter, unsigned int index )
 }
 
 /*****************************************************************************
+ *          lsp_get_builtin_base_entry_id
+ *
+ * Catalog entry id of the builtin base provider that matches lsp_info's
+ * address family / socket type / protocol - i.e. the bottom of the LSP
+ * protocol chain.  Returns 0 when no builtin provider matches.
+ */
+int lsp_get_builtin_base_entry_id( const WSAPROTOCOL_INFOW *lsp_info )
+{
+    int i;
+
+    if (!lsp_info) return 0;
+    for (i = 0; i < ARRAY_SIZE(supported_protocols); ++i)
+    {
+        const WSAPROTOCOL_INFOW *base = &supported_protocols[i];
+        if (base->ProtocolChain.ChainLen != 1) continue;  /* base only */
+        if (base->iAddressFamily != lsp_info->iAddressFamily) continue;
+        if (base->iSocketType != lsp_info->iSocketType) continue;
+        if (base->iProtocol != lsp_info->iProtocol) continue;
+        return base->dwCatalogEntryId;
+    }
+    return 0;
+}
+
+/*****************************************************************************
+ *          sock_enum_protocols_shallow
+ *
+ * Stack-light builtin protocol enumeration.  Used on threads with
+ * critically low stack (LSP DLL worker threads, e.g. SSLVPNRedirector.dll
+ * which consumes almost all of its 1 MB stack before enumerating).
+ * Deliberately avoids the wine debug channels and any deep call chain so
+ * it can run with only a few KB of stack remaining.  Returns the same
+ * results as WSAEnumProtocolsW.
+ */
+int sock_enum_protocols_shallow( int *filter, WSAPROTOCOL_INFOW *protocols, DWORD *size )
+{
+    DWORD i, count = 0;
+
+    if (!size) return SOCKET_ERROR;
+
+    for (i = 0; i < ARRAY_SIZE(supported_protocols); ++i)
+        if (protocol_matches_filter( filter, i ))
+            ++count;
+
+    if (!protocols || *size < count * sizeof(WSAPROTOCOL_INFOW))
+    {
+        *size = count * sizeof(WSAPROTOCOL_INFOW);
+        WSASetLastError( WSAENOBUFS );
+        return SOCKET_ERROR;
+    }
+
+    count = 0;
+    for (i = 0; i < ARRAY_SIZE(supported_protocols); ++i)
+        if (protocol_matches_filter( filter, i ))
+            protocols[count++] = supported_protocols[i];
+    return count;
+}
+
+/*****************************************************************************
  *          WSAEnumProtocolsA       [WS2_32.@]
  *
  *    see function WSAEnumProtocolsW
@@ -4426,40 +4535,13 @@ int WINAPI WSAEnumProtocolsA( int *filter, WSAPROTOCOL_INFOA *protocols, DWORD *
  */
 int WINAPI WSAEnumProtocolsW( int *filter, WSAPROTOCOL_INFOW *protocols, DWORD *size )
 {
-    DWORD i, count = 0;
-
-    /* Low stack guard: some LSP DLLs (e.g. SSLVPNRedirector.dll) create
-     * worker threads that consume nearly all of their 1 MB stack before
-     * calling WSAEnumProtocolsW.  Even our minimal builtin enumeration
-     * plus the DLL's post-return processing can overflow the stack.
-     * Return 0 protocols immediately so the DLL bails out early. */
+    /* LSP DLL worker threads can be nearly out of stack when they call
+     * this API directly.  Use the stack-light implementation (no wine
+     * debug channels, no deep call chain) so the LSP still receives
+     * correct results and can finish WSPStartup. */
     if (lsp_stack_low())
-    {
-        WARN("low stack -> returning 0 protocols\n");
-        if (size) *size = 0;
-        return 0;
-    }
+        return sock_enum_protocols_shallow( filter, protocols, size );
 
     TRACE("filter %p, protocols %p, size %p\n", filter, protocols, size);
-
-    for (i = 0; i < ARRAY_SIZE(supported_protocols); ++i)
-    {
-        if (protocol_matches_filter( filter, i ))
-            ++count;
-    }
-
-    if (!protocols || *size < count * sizeof(WSAPROTOCOL_INFOW))
-    {
-        *size = count * sizeof(WSAPROTOCOL_INFOW);
-        WSASetLastError( WSAENOBUFS );
-        return SOCKET_ERROR;
-    }
-
-    count = 0;
-    for (i = 0; i < ARRAY_SIZE(supported_protocols); ++i)
-    {
-        if (protocol_matches_filter( filter, i ))
-            protocols[count++] = supported_protocols[i];
-    }
-    return count;
+    return sock_enum_protocols_shallow( filter, protocols, size );
 }

@@ -89,6 +89,7 @@ struct per_thread_data
     int se_len;
     int pe_len;
     char ntoa_buffer[16]; /* 4*3 digits + 3 '.' + 1 '\0' */
+    BOOL lsp_in_dispatch; /* LSP WSPSocket call in flight on this thread */
 };
 
 extern int num_startup;

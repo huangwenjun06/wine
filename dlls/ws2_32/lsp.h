@@ -123,7 +123,9 @@ typedef struct _WPUUPCALLTABLE
 /* WSP function signatures - for casting void* from WSPPROC_TABLE */
 
 typedef SOCKET (WINAPI *LSP_WSPSOCKET_FUNC)( int, int, int, LPWSAPROTOCOL_INFOW, unsigned int, DWORD );
-typedef int (WINAPI *LSP_WSPCONNECT_FUNC)( SOCKET, const struct sockaddr *, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS );
+/* WSPConnect has 8 params: last one is lpErrno (out error code). */
+typedef int (WINAPI *LSP_WSPCONNECT_FUNC)( SOCKET, const struct sockaddr *, int,
+                                            LPWSABUF, LPWSABUF, LPQOS, LPQOS, LPINT );
 
 /* ======================================================================
  * WSPStartup entry point signatures
@@ -213,9 +215,20 @@ int      lsp_load_provider(LSP_PROVIDER_ENTRY *provider);
 void     lsp_unload_provider(LSP_PROVIDER_ENTRY *provider);
 LPWSPPROC_TABLE lsp_get_provider_dispatch(LSP_PROVIDER_ENTRY *provider);
 LSP_PROVIDER_ENTRY *lsp_get_chain_next(LSP_PROVIDER_ENTRY *provider);
+void     lsp_socket_register(SOCKET s, LSP_PROVIDER_ENTRY *provider);
+/* record that socket s was created through provider's WSPSocket */
+LSP_PROVIDER_ENTRY *lsp_socket_find_provider(SOCKET s);
+/* provider that owns socket s, or NULL */
+void     lsp_socket_unregister(SOCKET s);
 BOOL     lsp_is_lsp_loaded(void);
 void     lsp_set_lsp_enabled(BOOL enabled);
 int      lsp_write_provider_order(DWORD *entry, DWORD number);
 BOOL     lsp_stack_low(void);  /* check if current thread has < 32KB stack left */
+BOOL     lsp_catalog_loaded(void);  /* catalog in memory (count > 0) */
+int      sock_enum_protocols_shallow(int *filter, WSAPROTOCOL_INFOW *protocols,
+                                     DWORD *size);  /* stack-light builtin enum */
+int      lsp_get_builtin_base_entry_id(const WSAPROTOCOL_INFOW *lsp_info);
+/* catalog entry id of the builtin base provider matching lsp_info's
+ * af/type/proto (1002..1040 range), 0 if none */
 
 #endif /* __WINE_WS2_32_LSP_H */

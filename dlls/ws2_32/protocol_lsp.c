@@ -133,8 +133,7 @@ static BOOL lsp_get_builtin_base_path( const GUID *guid, WCHAR *path, DWORD path
     static const GUID base_ipx    = {0x11058240, 0xbe47, 0x11cf, {0x95, 0xc8, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}};
     static const GUID base_ipx_spx = {0x11058241, 0xbe47, 0x11cf, {0x95, 0xc8, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}};
     static const GUID base_bth    = {0x9fc48064, 0x7298, 0x43e4, {0xb7, 0xbd, 0x18, 0x1f, 0x20, 0x89, 0x79, 0x2a}};
-    static const WCHAR mswsock_rel[] = L"system32\\mswsock.dll";
-    static const WCHAR fmt[] = {'%','s','\\','%','s',0};
+    static const WCHAR mswsock_rel[] = L"mswsock.dll";
     WCHAR windir[MAX_PATH];
     UINT n;
 
@@ -143,9 +142,13 @@ static BOOL lsp_get_builtin_base_path( const GUID *guid, WCHAR *path, DWORD path
         !IsEqualGUID( guid, &base_bth ))
         return FALSE;
 
+    /* GetSystemDirectoryW already returns "...\windows\system32", so only
+     * append the DLL name.  (The previous code appended "system32\mswsock.dll"
+     * producing "system32\system32\mswsock.dll", which the LSP's LoadLibrary
+     * rejected and WSPStartup failed with ERROR_INVALID_PARAMETER.) */
     n = GetSystemDirectoryW( windir, MAX_PATH );
-    if (!n || n >= MAX_PATH) lstrcpyW( windir, L"C:\\windows" );
-    wsprintfW( path, fmt, windir, mswsock_rel );
+    if (!n || n >= MAX_PATH) lstrcpyW( windir, L"C:\\windows\\system32" );
+    wsprintfW( path, L"%s\\%s", windir, mswsock_rel );
     return TRUE;
 }
 
@@ -166,14 +169,37 @@ int WINAPI WSCGetProviderPath( GUID *provider, WCHAR *path, int *len, int *errco
     if (!provider || !len) { if (errcode) *errcode = WSAEFAULT; return -1; }
     if (*len <= 0) { if (errcode) *errcode = WSAEINVAL; return -1; }
 
-    /* Low stack guard: return error to avoid stack overflow.
-     * Returning a path (even a default one) causes the DLL to continue
-     * processing (LoadLibrary, string ops, etc.) which overflows.
-     * Returning error makes the DLL skip this provider entirely. */
+    /* Low stack: LSP DLL worker threads run nearly out of stack.  The
+     * registry catalog lookup below is too deep for that, but resolving
+     * the well-known builtin base providers (mswsock.dll) only needs
+     * IsEqualGUID + GetSystemDirectoryW, and looking up an LSP provider
+     * by GUID walks only the in-memory catalog - both shallow enough.
+     * No TRACE here: the wine debug channel itself would burn stack. */
     if (lsp_stack_low())
     {
+        if (lsp_get_builtin_base_path( provider, base_path, MAX_PATH ))
+        {
+            needed = (wcslen( base_path ) + 1) * sizeof(WCHAR);
+            if ((DWORD)*len < needed) { *len = needed; if (errcode) *errcode = WSAEFAULT; return -1; }
+            memcpy( path, base_path, needed );
+            *len = needed;
+            if (errcode) *errcode = 0;
+            return 0;
+        }
+        if (lsp_catalog_loaded())
+        {
+            p = lsp_find_provider_by_guid( provider );
+            if (p && p->dll_path[0])
+            {
+                needed = (wcslen( p->dll_path ) + 1) * sizeof(WCHAR);
+                if ((DWORD)*len < needed) { *len = needed; if (errcode) *errcode = WSAEFAULT; return -1; }
+                memcpy( path, p->dll_path, needed );
+                *len = needed;
+                if (errcode) *errcode = 0;
+                return 0;
+            }
+        }
         if (errcode) *errcode = WSANO_RECOVERY;
-        TRACE("low stack -> error (provider not found)\n");
         return -1;
     }
 
@@ -330,23 +356,9 @@ int WINAPI WSCEnumProtocols( int *protocols, WSAPROTOCOL_INFOW *info,
     DWORD orig_len;
     BOOL is_reentrant;
 
-    TRACE( "(protocols=%p, info=%p, len=%p, err=%p)\n", protocols, info, len, err );
     if (!len || !err) return -1;
     *err = 0;
     orig_len = *len;
-
-    /* If the calling thread has critically low stack (< 32 KB),
-     * skip ALL enumeration and return 0 protocols immediately.
-     * SSLVPNRedirector.dll creates threads that consume ~1 MB
-     * of stack before calling WSCEnumProtocols/WSAEnumProtocolsW.
-     * Returning 0 causes the DLL to skip LSP initialization entirely. */
-    if (lsp_stack_low())
-    {
-        TRACE("low stack -> 0 protocols\n");
-        if (len) *len = 0;
-        if (err) *err = 0;
-        return 0;
-    }
 
     /* Reentrancy guard: if WSCEnumProtocols is already active on this
      * thread (e.g. SSLVPNRedirector.dll calls it recursively), delegate
@@ -359,9 +371,93 @@ int WINAPI WSCEnumProtocols( int *protocols, WSAPROTOCOL_INFOW *info,
     {
         int ret = WSAEnumProtocolsW(protocols, info, len);
         if (ret == SOCKET_ERROR) *err = WSAENOBUFS;
-        TRACE("reentrant call -> builtin only (ret=%d)\n", ret);
         TlsSetValue(tls_wsc_reentrant, NULL);
         return ret;
+    }
+
+    /* Stack-light fast path: the catalog is already in memory.
+     *
+     * SSLVPNRedirector.dll creates worker threads that consume nearly
+     * all of their 1 MB stack before calling WSCEnumProtocols.  The old
+     * low-stack guard returned 0 protocols on those threads, which made
+     * the LSP's WSPStartup fail with ERROR_INVALID_PARAMETER (87).
+     * Serving the enumeration directly from memory (no registry access,
+     * no provider preload, no wine debug channels) uses only a few
+     * hundred bytes of stack, so the LSP receives correct results even
+     * on thin threads. */
+    if (lsp_catalog_loaded())
+    {
+        int ret;
+
+        lsp_count = lsp_enum_protocols( protocols, NULL, &lsp_needed, FALSE );
+        if (lsp_count < 0) lsp_count = 0;
+
+        builtin_needed = 0;
+        sock_enum_protocols_shallow( protocols, NULL, &builtin_needed );
+
+        total_needed = lsp_needed + builtin_needed;
+        if (!info || orig_len < total_needed)
+        {
+            *len = total_needed;
+            *err = WSAENOBUFS;
+            TlsSetValue(tls_wsc_reentrant, NULL);
+            return -1;
+        }
+
+        if (lsp_count > 0)
+        {
+            DWORD lsp_actual = orig_len;
+            DWORD remaining;
+            int lsp_filled = lsp_enum_protocols( protocols, info, &lsp_actual, FALSE );
+
+            if (lsp_filled < 0) lsp_filled = 0;
+            remaining = orig_len - lsp_actual;
+            builtin_count = sock_enum_protocols_shallow(
+                protocols, (WSAPROTOCOL_INFOW *)((BYTE *)info + lsp_actual), &remaining );
+            if (builtin_count >= 0)
+            {
+                *len = lsp_actual + builtin_count * sizeof(WSAPROTOCOL_INFOW);
+                ret = lsp_filled + builtin_count;
+            }
+            else
+            {
+                *len = lsp_actual;
+                ret = lsp_filled;
+            }
+        }
+        else
+        {
+            builtin_needed = orig_len;
+            builtin_count = sock_enum_protocols_shallow( protocols, info, &builtin_needed );
+            if (builtin_count < 0)
+            {
+                *len = builtin_needed;
+                *err = WSAENOBUFS;
+                TlsSetValue(tls_wsc_reentrant, NULL);
+                return -1;
+            }
+            *len = builtin_count * sizeof(WSAPROTOCOL_INFOW);
+            ret = builtin_count;
+        }
+        TlsSetValue(tls_wsc_reentrant, NULL);
+        return ret;
+    }
+
+    TRACE( "(protocols=%p, info=%p, len=%p, err=%p)\n", protocols, info, len, err );
+
+    /* Catalog not in memory yet.  Loading it walks the registry and
+     * preloads LSP DLLs (WSPStartup), which needs far more stack than a
+     * nearly-exhausted worker thread can provide; bail out so we do not
+     * overflow.  In practice the catalog is loaded by the app's first
+     * socket call (WSASocketW/WSAStartup), so this only happens when the
+     * very first WSC* call originates from an LSP thread. */
+    if (lsp_stack_low())
+    {
+        TRACE("low stack, catalog not loaded -> 0 protocols\n");
+        *len = 0;
+        *err = 0;
+        TlsSetValue(tls_wsc_reentrant, NULL);
+        return 0;
     }
 
     lsp_catalog_load();
@@ -395,13 +491,14 @@ int WINAPI WSCEnumProtocols( int *protocols, WSAPROTOCOL_INFOW *info,
     if (lsp_count > 0)
     {
         DWORD lsp_actual = orig_len;
+        DWORD remaining;
         int lsp_filled = lsp_enum_protocols( protocols, info, &lsp_actual, FALSE );
         if (lsp_filled < 0) lsp_filled = 0;
 
         /* Step 5: fill builtin providers after LSP entries.
          * WSAEnumProtocolsW does NOT update *size on success, so compute
          * bytes used from builtin_count. */
-        DWORD remaining = orig_len - lsp_actual;
+        remaining = orig_len - lsp_actual;
         builtin_count = WSAEnumProtocolsW(
             protocols, (WSAPROTOCOL_INFOW *)((BYTE *)info + lsp_actual), &remaining );
         if (builtin_count >= 0)
