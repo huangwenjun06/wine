@@ -21,7 +21,7 @@
 @ stub SvchostPushServiceGlobals
 @ stdcall TransmitFile(long long long long ptr ptr long)
 @ stdcall WSARecvEx(long ptr long ptr)
-@ stub WSPStartup
+@ stdcall WSPStartup(long long long long long long long long long long long long long long long long long long long)
 @ stub dn_expand
 @ stub getnetbyname
 @ stub inet_network

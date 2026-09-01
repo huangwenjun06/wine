@@ -109,14 +109,58 @@ int WINAPI WSCGetProviderInfo( GUID *provider, WSC_PROVIDER_INFO_TYPE info_type,
 }
 
 /* =====================================================================
+ * Builtin base provider DLL path
+ *
+ * The LSP (e.g. SSLVPNRedirector.dll) resolves its base provider by:
+ *   1. reading ChainEntries[ChainLen-1] (a base catalog entry id),
+ *   2. enumerating providers to find the base (ChainLen==1) entry,
+ *   3. calling WSCGetProviderPath(base ProviderId GUID) to get the DLL,
+ *   4. LoadLibrary + GetProcAddress("WSPStartup") on that DLL.
+ *
+ * In Wine the base providers (TCP/IP, UDP, IPv6, IPX, Bluetooth) are
+ * builtin to ws2_32 and served through mswsock.dll.  WSCGetProviderPath
+ * must therefore return the mswsock.dll path for the well-known base
+ * provider GUIDs, otherwise the LSP aborts with ERROR_INVALID_PARAMETER
+ * (87) at step 3.
+ *
+ * Returns TRUE and copies the path into 'path' if 'guid' is a builtin
+ * base provider; returns FALSE otherwise.
+ * ===================================================================== */
+static BOOL lsp_get_builtin_base_path( const GUID *guid, WCHAR *path, DWORD path_chars )
+{
+    static const GUID base_tcp4   = {0xe70f1aa0, 0xab8b, 0x11cf, {0x8c, 0xa3, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}};
+    static const GUID base_ip6    = {0xf9eab0c0, 0x26d4, 0x11d0, {0xbb, 0xbf, 0x00, 0xaa, 0x00, 0x6c, 0x34, 0xe4}};
+    static const GUID base_ipx    = {0x11058240, 0xbe47, 0x11cf, {0x95, 0xc8, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}};
+    static const GUID base_ipx_spx = {0x11058241, 0xbe47, 0x11cf, {0x95, 0xc8, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92}};
+    static const GUID base_bth    = {0x9fc48064, 0x7298, 0x43e4, {0xb7, 0xbd, 0x18, 0x1f, 0x20, 0x89, 0x79, 0x2a}};
+    static const WCHAR mswsock_rel[] = L"system32\\mswsock.dll";
+    static const WCHAR fmt[] = {'%','s','\\','%','s',0};
+    WCHAR windir[MAX_PATH];
+    UINT n;
+
+    if (!IsEqualGUID( guid, &base_tcp4 ) && !IsEqualGUID( guid, &base_ip6 ) &&
+        !IsEqualGUID( guid, &base_ipx ) && !IsEqualGUID( guid, &base_ipx_spx ) &&
+        !IsEqualGUID( guid, &base_bth ))
+        return FALSE;
+
+    n = GetSystemDirectoryW( windir, MAX_PATH );
+    if (!n || n >= MAX_PATH) lstrcpyW( windir, L"C:\\windows" );
+    wsprintfW( path, fmt, windir, mswsock_rel );
+    return TRUE;
+}
+
+/* =====================================================================
  * WSCGetProviderPath
  *
  * CRITICAL: VPN installer calls this after WSCInstallProvider.
+ * Also called by the LSP during its own WSPStartup to resolve the base
+ * provider DLL (mswsock.dll).
  * ===================================================================== */
 int WINAPI WSCGetProviderPath( GUID *provider, WCHAR *path, int *len, int *errcode )
 {
     LSP_PROVIDER_ENTRY *p;
     DWORD needed;
+    WCHAR base_path[MAX_PATH];
 
     TRACE( "(%s %p %p %p)\n", debugstr_guid(provider), path, len, errcode );
     if (!provider || !len) { if (errcode) *errcode = WSAEFAULT; return -1; }
@@ -133,6 +177,19 @@ int WINAPI WSCGetProviderPath( GUID *provider, WCHAR *path, int *len, int *errco
         return -1;
     }
 
+    /* 1) Builtin base providers are served by mswsock.dll. */
+    if (lsp_get_builtin_base_path( provider, base_path, MAX_PATH ))
+    {
+        needed = (wcslen( base_path ) + 1) * sizeof(WCHAR);
+        if ((DWORD)*len < needed) { *len = needed; if (errcode) *errcode = WSAEFAULT; return -1; }
+        memcpy( path, base_path, needed );
+        *len = needed;
+        if (errcode) *errcode = 0;
+        TRACE( "builtin base provider -> %s\n", debugstr_w(path) );
+        return 0;
+    }
+
+    /* 2) LSP providers registered in the catalog. */
     lsp_catalog_load();
     p = lsp_find_provider_by_guid( provider );
     if (!p)
